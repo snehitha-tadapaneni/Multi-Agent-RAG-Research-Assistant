@@ -20,8 +20,7 @@ Here's how the agents works:
 5. Decision Agent: Combine the draft answer and verification to create a final human readable response.
 6. Test-to-Speech Agent: Reads the answer aloud for acccessibility and convenience.
 
- 
-
+ <img width="495" height="450" alt="Screenshot 2025-07-24 at 6 06 06 PM" src="https://github.com/user-attachments/assets/bb807f36-2750-4de7-ad67-72fe4e7c051d" />
 
 **Installation and Requirements:**
 ```
