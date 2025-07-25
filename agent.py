@@ -1,33 +1,44 @@
-# import necessary libraries
+# Import neccessary libraries
 import os
-import base64
 import tempfile
 import warnings
 import gradio as gr
-import pandas as pd
-import pdfplumber
 from gtts import gTTS
-from typing import List
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-
+from langgraph.graph import StateGraph, END
+from langgraph.graph.message import add_messages
 from langchain.schema import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import Chroma
-from langchain.retrievers import BM25Retriever, EnsembleRetriever
-
+from langchain_community.retrievers import BM25Retriever
+from langchain.retrievers import EnsembleRetriever
 from ibm_watsonx_ai import Credentials
 from ibm_watsonx_ai.foundation_models import ModelInference
-from langchain_ibm import WatsonxEmbeddings, WatsonxLLM
+from langchain_ibm import WatsonxEmbeddings
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 warnings.filterwarnings("ignore")
 
-# IBM Watsonx credentials
+# defining state Schema
+from typing import TypedDict, List
+
+class RAGState(TypedDict):
+    file: str
+    query: str
+    docs: List[Document]
+    top_docs: List[Document]
+    draft_answer: str
+    verification: str
+    citation: str
+    final_response: str
+
+
+# ---- Credentials ----
 credentials = Credentials(url="https://us-south.ml.cloud.ibm.com")
 project_id = "skills-network"
 
-# ---- Document Loader (Docling Style) ----
+# ---- Document Parsing ----
 def document_loader(file):
     loader = PyPDFLoader(file.name)
     return loader.load()
@@ -38,7 +49,7 @@ def text_splitter(docs):
 
 # ---- Retriever Agent ----
 class RetrieverAgent:
-    def __init__(self, documents: List[Document]):
+    def __init__(self, documents):
         self.documents = documents
         self.embeddings = WatsonxEmbeddings(
             model_id="ibm/slate-125m-english-rtrvr",
@@ -62,14 +73,13 @@ class ResearchAgent:
             params={"max_tokens": 300, "temperature": 0.3}
         )
 
-    def generate_prompt(self, question: str, context: str) -> str:
+    def generate_prompt(self, question, context):
         return f"""
         You are an AI assistant designed to provide precise and factual answers based on the given context.
 
         **Instructions:**
         - Answer the following question using only the provided context.
         - Be clear, concise, and factual.
-        - Return as much information as you can get from the context.
 
         **Question:** {question}
         **Context:**
@@ -78,19 +88,18 @@ class ResearchAgent:
         **Provide your answer below:**
         """
 
-    def generate(self, question: str, documents: List[Document]) -> dict:
+    def generate(self, question, documents):
         context = "\n\n".join([doc.page_content for doc in documents])
         prompt = self.generate_prompt(question, context)
         try:
             response = self.model.chat(messages=[{"role": "user", "content": prompt}])
-            llm_response = response['choices'][0]['message']['content'].strip()
+            return {"draft_answer": response['choices'][0]['message']['content'].strip()}
         except Exception as e:
-            llm_response = f"❌ Error: {str(e)}"
-        return {"draft_answer": llm_response, "context_used": context}
+            return {"draft_answer": f"❌ Error: {str(e)}"}
 
 # ---- Verification Agent ----
 class VerificationAgent:
-    def verify(self, answer: str, docs: List[Document]) -> str:
+    def verify(self, answer, docs):
         context_texts = [doc.page_content for doc in docs]
         try:
             vectorizer = TfidfVectorizer().fit(context_texts + [answer])
@@ -102,28 +111,15 @@ class VerificationAgent:
         except Exception as e:
             return f"❌ Verification error: {e}"
 
-# ---- Citation/Metadata Agent ----
+# ---- Citation Agent ----
 class CitationAgent:
-    def extract_metadata(self, documents: List[Document]) -> str:
-        try:
-            titles = [doc.metadata.get("title", "") for doc in documents if "title" in doc.metadata]
-            return f"📚 Extracted Metadata:\nTitle(s): {', '.join(titles) if titles else 'Not available'}"
-        except Exception as e:
-            return f"❌ Metadata extraction error: {e}"
-
-# ---- OCR Image Agent (placeholder) ----
-def ocr_image_to_text(image_path: str) -> str:
-    try:
-        import pytesseract
-        from PIL import Image
-        text = pytesseract.image_to_string(Image.open(image_path))
-        return text.strip()
-    except Exception as e:
-        return f"❌ OCR Error: {e}"
+    def extract_metadata(self, documents):
+        titles = [doc.metadata.get("title", "") for doc in documents if "title" in doc.metadata]
+        return f"📚 Extracted Title(s): {', '.join(titles) if titles else 'Not available'}"
 
 # ---- Decision Agent ----
 class DecisionAgent:
-    def finalize(self, answer: str, verification: str, citation: str = "") -> str:
+    def finalize(self, answer, verification, citation):
         return f"""
 📌 Final Answer:
 {answer}
@@ -135,62 +131,78 @@ class DecisionAgent:
 {citation}
 """
 
-# ---- Unified Orchestrator ----
-def process_query(file, query):
-    if not file or not query:
-        return "Please upload a file and ask a question.", None
+# ---- LangGraph DAG ----
+def create_rag_pipeline():
+    def parse_node(state):
+        docs = document_loader(state["file"])
+        return {"docs": text_splitter(docs), "query": state["query"]}
+
+    def retrieve_node(state):
+        retriever = RetrieverAgent(state["docs"]).build()
+        return {"top_docs": retriever.get_relevant_documents(state["query"])}
+
+    def research_node(state):
+        result = ResearchAgent().generate(state["query"], state["top_docs"])
+        return {"draft_answer": result["draft_answer"]}
+
+    def verify_node(state):
+        check = VerificationAgent().verify(state["draft_answer"], state["top_docs"])
+        return {"verification": check}
+
+    def citation_node(state):
+        citation = CitationAgent().extract_metadata(state["top_docs"])
+        return {"citation": citation}
+
+    def decision_node(state):
+        result = DecisionAgent().finalize(state["draft_answer"], state["verification"], state["citation"])
+        return {"final_response": result}
+
+    graph = StateGraph(RAGState)
+    graph.add_node("Parse", parse_node)
+    graph.add_node("Retrieve", retrieve_node)
+    graph.add_node("Research", research_node)
+    graph.add_node("Verify", verify_node)
+    graph.add_node("Citation", citation_node)
+    graph.add_node("Decision", decision_node)
+
+    graph.set_entry_point("Parse")
+    graph.add_edge("Parse", "Retrieve")
+    graph.add_edge("Retrieve", "Research")
+    graph.add_edge("Research", "Verify")
+    graph.add_edge("Verify", "Citation")
+    graph.add_edge("Citation", "Decision")
+    graph.add_edge("Decision", END)
+
+    return graph.compile()
+
+pipeline = create_rag_pipeline()
+
+# ---- Gradio Interface ----
+def gradio_pipeline(file, query):
     try:
-        docs = document_loader(file)
-        chunks = text_splitter(docs)
-
-        retriever = RetrieverAgent(chunks).build()
-        top_docs = retriever.get_relevant_documents(query)
-
-        research = ResearchAgent()
-        result = research.generate(query, top_docs)
-        answer = result["draft_answer"]
-
-        verifier = VerificationAgent()
-        check = verifier.verify(answer, top_docs)
-
-        citation_agent = CitationAgent()
-        citation = citation_agent.extract_metadata(top_docs)
-
-        decision = DecisionAgent()
-        final_response = decision.finalize(answer, check, citation)
+        result = pipeline.invoke({"file": file, "query": query})
+        final_response = result["final_response"]
 
         tts = gTTS(text=final_response)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
             tts.save(tmp.name)
             audio_path = tmp.name
-
         return final_response, audio_path
-
     except Exception as e:
         return f"❌ Error: {e}", None
 
-# ---- Gradio App ----
-with gr.Blocks(title="📚 Multimodal RAG Research Assistant") as app:
+with gr.Blocks(title="📚 Multimodal RAG Research Assistant with LangGraph") as app:
     gr.Markdown("""
-    # 🤖 Multimodal AI Research Assistant  
-    Upload a **PDF** and ask a question.  
-    The model will read, analyze, verify, and even speak the answer!  
-    _Powered by IBM Watsonx + LangChain + gTTS_
+    # 🤖 Multimodal AI Research Assistant (LangGraph-powered)
+    Upload a **PDF** and ask a question. The assistant will parse, retrieve, reason, verify, cite, and speak the answer.
     """)
 
-    with gr.Row():
-        file_input = gr.File(label="📁 Upload PDF", file_types=[".pdf"], type="filepath")
+    file_input = gr.File(label="Upload PDF", file_types=[".pdf"], type="filepath")
+    query = gr.Textbox(label="Ask your question", placeholder="E.g., What is the methodology used?", lines=2)
+    submit_btn = gr.Button("💬 Get Answer")
+    output_text = gr.Textbox(label="Model Response", lines=10)
+    output_audio = gr.Audio(label="Listen", type="filepath", autoplay=True)
 
-    with gr.Row():
-        query = gr.Textbox(label="❓ Ask your question", placeholder="E.g., Summarize this paper", lines=2)
+    submit_btn.click(fn=gradio_pipeline, inputs=[file_input, query], outputs=[output_text, output_audio])
 
-    with gr.Row():
-        submit_btn = gr.Button("💬 Get Answer")
-
-    with gr.Row():
-        output_text = gr.Textbox(label="🧠 Model Response", lines=10)
-        output_audio = gr.Audio(label="🔊 Listen", type="filepath", autoplay=True)
-
-    submit_btn.click(fn=process_query, inputs=[file_input, query], outputs=[output_text, output_audio])
-
-app.launch(server_name="127.0.0.1", server_port=7860)
+app.launch(server_name="172.22.132.163", server_port=8888)
